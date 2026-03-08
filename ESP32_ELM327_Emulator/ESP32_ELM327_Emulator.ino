@@ -34,19 +34,34 @@
 #define BT_DEVICE_NAME  "OBD2_ESP32"
 #define ELM_VERSION     "ELM327 v2.1"
 
-// ─── 30-Second Driving Profile ───────────────────────────────────────────────
+// ─── 10-Minute Driving Profile ───────────────────────────────────────────────
 //
-//  Time │ Phase           │ RPM  │ Speed │ Throttle │ Load │ Coolant │ MAF
-//  ─────┼─────────────────┼──────┼───────┼──────────┼──────┼─────────┼──────
-//   0s  │ Idle            │  800 │   0   │   15%    │ 20%  │  85°C   │  3.0
-//   5s  │ Begin accel     │ 2200 │  30   │   45%    │ 55%  │  88°C   │ 14.0
-//  12s  │ Mid accel       │ 3500 │  70   │   65%    │ 75%  │  90°C   │ 22.0
-//  20s  │ Cruise          │ 2400 │  90   │   25%    │ 40%  │  90°C   │ 12.0
-//  26s  │ Deceleration    │ 1200 │  40   │    5%    │ 15%  │  89°C   │  5.0
-//  30s  │ Idle (loops)    │  800 │   0   │   15%    │ 20%  │  85°C   │  3.0
+// Simulates a realistic urban+road trip cycle that loops every 10 minutes.
+// Gear is calculated live from speed/RPM ratio (no profile field needed).
+// Boost (MAP above atmospheric) rises with throttle/load on turbo assumption.
+//
+//  t(s) │ Phase                  │ RPM  │ Spd │ Thr │ Load │ Cool │ MAF  │ MAP  │ IAT │ Fuel% │ Volt
+//  ─────┼────────────────────────┼──────┼─────┼─────┼──────┼──────┼──────┼──────┼─────┼───────┼──────
+//    0  │ Cold idle              │  950 │   0 │  12 │  18  │  65  │  2.5 │  98  │  28 │  75   │ 12.4
+//   30  │ Warm-up idle           │  850 │   0 │  12 │  20  │  75  │  3.0 │ 100  │  30 │  75   │ 13.8
+//   60  │ Pull away (1st)        │ 2800 │  15 │  55 │  65  │  78  │ 18.0 │ 145  │  32 │  74   │ 14.2
+//   90  │ 2nd gear accel         │ 3200 │  35 │  60 │  72  │  82  │ 24.0 │ 155  │  34 │  73   │ 14.3
+//  120  │ 3rd gear cruise        │ 2400 │  55 │  30 │  42  │  87  │ 14.0 │ 115  │  35 │  72   │ 14.2
+//  150  │ Traffic stop (idle)    │  820 │   0 │  10 │  18  │  89  │  2.8 │ 100  │  36 │  72   │ 13.9
+//  180  │ Re-accelerate 1→2→3    │ 3500 │  50 │  70 │  80  │  90  │ 28.0 │ 165  │  37 │  71   │ 14.4
+//  240  │ 4th gear road cruise   │ 2200 │  80 │  28 │  38  │  90  │ 13.0 │ 112  │  38 │  70   │ 14.2
+//  300  │ 5th gear motorway      │ 2600 │ 110 │  32 │  44  │  91  │ 16.0 │ 118  │  39 │  69   │ 14.3
+//  360  │ Hard overtake (boost)  │ 4200 │ 130 │  85 │  92  │  92  │ 38.0 │ 210  │  41 │  67   │ 14.5
+//  390  │ Settle back to cruise  │ 2600 │ 110 │  30 │  40  │  91  │ 14.0 │ 115  │  40 │  67   │ 14.2
+//  420  │ Exit ramp decel        │ 1400 │  60 │   5 │  14  │  90  │  4.5 │ 102  │  39 │  67   │ 13.8
+//  450  │ Urban crawl            │ 1600 │  30 │  25 │  32  │  89  │  9.0 │ 108  │  38 │  66   │ 14.0
+//  480  │ Stop (engine on)       │  820 │   0 │  10 │  18  │  89  │  2.8 │ 100  │  37 │  66   │ 13.8
+//  510  │ Final run home         │ 2400 │  50 │  40 │  52  │  89  │ 16.0 │ 120  │  37 │  65   │ 14.1
+//  560  │ Slow + park            │ 1000 │  10 │  15 │  22  │  88  │  4.0 │ 100  │  36 │  65   │ 13.6
+//  600  │ Idle (loop back)       │  850 │   0 │  12 │  18  │  87  │  2.8 │ 100  │  35 │  65   │ 13.5
 
-#define PROFILE_LEN    6
-#define CYCLE_SECONDS  30.0f
+#define PROFILE_LEN    17
+#define CYCLE_SECONDS  600.0f   // 10 minutes
 
 struct ProfilePoint {
   float t;          // seconds within cycle
@@ -55,23 +70,50 @@ struct ProfilePoint {
   float throttle;   // throttle position 0–100 %
   float load;       // engine load 0–100 %
   float coolant;    // coolant temperature °C
-  float maf;        // MAF rate g/s
-  float map_kpa;    // MAP absolute pressure kPa
-  float voltage;    // battery/control module voltage V
+  float maf;        // MAF air flow g/s
+  float map_kpa;    // MAP absolute pressure kPa (101 = atmospheric, >101 = boost)
   float intake;     // intake air temperature °C
-  float timing;     // timing advance degrees before TDC
+  float fuel_pct;   // fuel tank level %
+  float voltage;    // battery/module voltage V
   float fuelTrim;   // short-term fuel trim %
 };
 
 const ProfilePoint profile[PROFILE_LEN] = {
-  //  t      rpm    spd  thr  load  cool   maf   map   volt   iat  timing  ftrim
-  {  0.0f,   800,    0,  15,   20,   85,   3.0,   35,  12.6,   30,   8.0,   0.0 },
-  {  5.0f,  2200,   30,  45,   55,   88,  14.0,   65,  14.2,   32,  12.0,   1.6 },
-  { 12.0f,  3500,   70,  65,   75,   90,  22.0,   80,  14.4,   35,  15.0,  -0.8 },
-  { 20.0f,  2400,   90,  25,   40,   90,  12.0,   55,  14.3,   36,  11.0,   0.4 },
-  { 26.0f,  1200,   40,   5,   15,   89,   5.0,   40,  13.8,   34,   6.0,  -1.6 },
-  { 30.0f,   800,    0,  15,   20,   85,   3.0,   35,  12.6,   30,   8.0,   0.0 },
+  //   t      rpm   spd  thr  load  cool   maf   map   iat  fuel   volt  ftrim
+  {   0.0f,   950,    0,  12,   18,   65,   2.5,   98,   28,  75.0, 12.4,  0.0 },
+  {  30.0f,   850,    0,  12,   20,   75,   3.0,  100,   30,  75.0, 13.8,  0.0 },
+  {  60.0f,  2800,   15,  55,   65,   78,  18.0,  145,   32,  74.8, 14.2,  1.6 },
+  {  90.0f,  3200,   35,  60,   72,   82,  24.0,  155,   34,  74.5, 14.3,  0.8 },
+  { 120.0f,  2400,   55,  30,   42,   87,  14.0,  115,   35,  74.2, 14.2,  0.4 },
+  { 150.0f,   820,    0,  10,   18,   89,   2.8,  100,   36,  74.0, 13.9,  0.0 },
+  { 180.0f,  3500,   50,  70,   80,   90,  28.0,  165,   37,  73.5, 14.4,  1.2 },
+  { 240.0f,  2200,   80,  28,   38,   90,  13.0,  112,   38,  73.0, 14.2,  0.4 },
+  { 300.0f,  2600,  110,  32,   44,   91,  16.0,  118,   39,  72.0, 14.3,  0.4 },
+  { 360.0f,  4200,  130,  85,   92,   92,  38.0,  210,   41,  70.5, 14.5,  2.0 },
+  { 390.0f,  2600,  110,  30,   40,   91,  14.0,  115,   40,  70.0, 14.2,  0.4 },
+  { 420.0f,  1400,   60,   5,   14,   90,   4.5,  102,   39,  69.8, 13.8, -1.6 },
+  { 450.0f,  1600,   30,  25,   32,   89,   9.0,  108,   38,  69.5, 14.0,  0.0 },
+  { 480.0f,   820,    0,  10,   18,   89,   2.8,  100,   37,  69.3, 13.8,  0.0 },
+  { 510.0f,  2400,   50,  40,   52,   89,  16.0,  120,   37,  68.8, 14.1,  0.8 },
+  { 560.0f,  1000,   10,  15,   22,   88,   4.0,  100,   36,  68.5, 13.6,  0.0 },
+  { 600.0f,   850,    0,  12,   18,   87,   2.8,  100,   35,  68.0, 13.5,  0.0 },
 };
+
+// ─── Gear Calculation ────────────────────────────────────────────────────────
+// Calculates current gear from speed/RPM ratio (final drive ~3.9, tyre ~0.35m).
+// Returns 0 if stationary, 1–6 for gears.
+uint8_t calcGear(float rpm, float speed_kmh) {
+  if (speed_kmh < 2.0f || rpm < 500.0f) return 0;
+  // Approximate speed-per-1000rpm thresholds for each gear
+  // Gear: 1=~8, 2=~16, 3=~26, 4=~36, 5=~48, 6=~60 km/h per 1000rpm
+  float ratio = speed_kmh / (rpm / 1000.0f);
+  if      (ratio <  12.0f) return 1;
+  else if (ratio <  21.0f) return 2;
+  else if (ratio <  31.0f) return 3;
+  else if (ratio <  42.0f) return 4;
+  else if (ratio <  54.0f) return 5;
+  else                     return 6;
+}
 
 // ─── Globals ─────────────────────────────────────────────────────────────────
 BluetoothSerial SerialBT;
@@ -105,9 +147,9 @@ ProfilePoint getCurrentProfile() {
   p.coolant  = lerpf(profile[lo].coolant,  profile[hi].coolant,  alpha);
   p.maf      = lerpf(profile[lo].maf,      profile[hi].maf,      alpha);
   p.map_kpa  = lerpf(profile[lo].map_kpa,  profile[hi].map_kpa,  alpha);
-  p.voltage  = lerpf(profile[lo].voltage,  profile[hi].voltage,  alpha);
   p.intake   = lerpf(profile[lo].intake,   profile[hi].intake,   alpha);
-  p.timing   = lerpf(profile[lo].timing,   profile[hi].timing,   alpha);
+  p.fuel_pct = lerpf(profile[lo].fuel_pct, profile[hi].fuel_pct, alpha);
+  p.voltage  = lerpf(profile[lo].voltage,  profile[hi].voltage,  alpha);
   p.fuelTrim = lerpf(profile[lo].fuelTrim, profile[hi].fuelTrim, alpha);
   return p;
 }
@@ -139,51 +181,62 @@ String makeResponse(uint8_t svc, uint8_t pid, uint8_t *data, int len) {
 
 int simulatePID(uint8_t service, uint8_t pid, uint8_t *buf) {
   ProfilePoint p = getCurrentProfile();
+  uint8_t gear   = calcGear(p.rpm, p.speed);
+
+  // Boost pressure in kPa above atmospheric (101 kPa).
+  // Positive = turbo boost, negative = vacuum (throttled engine).
+  float boost_kpa = p.map_kpa - 101.0f;
+
+  // Timing advance: derived from load+rpm (higher load/rpm = more advance)
+  float timing = 8.0f + (p.load / 100.0f) * 12.0f + (p.rpm / 6000.0f) * 8.0f;
 
   if (service == 0x01) {
     switch (pid) {
 
-      // Supported PIDs 0x01–0x20  (bitmask)
+      // ── Supported PIDs bitmask 0x01–0x20 ─────────────────────────────────
+      // Bits for: 04,05,06,07,0B,0C,0D,0E,0F,10,11,1C,1F
       case 0x00:
-        buf[0]=0xBE; buf[1]=0x3F; buf[2]=0xA8; buf[3]=0x13;
+        buf[0]=0xBE; buf[1]=0x3F; buf[2]=0xB8; buf[3]=0x13;
         return 4;
 
-      // Monitor status (no DTCs, all monitors ready)
+      // ── Monitor status – no DTCs, all monitors complete ───────────────────
       case 0x01:
         buf[0]=0x00; buf[1]=0x07; buf[2]=0xFF; buf[3]=0x00;
         return 4;
 
-      // Fuel system status – closed-loop
+      // ── Fuel system status – closed-loop ─────────────────────────────────
       case 0x03:
         buf[0]=0x02; buf[1]=0x00;
         return 2;
 
-      // Engine load  A*100/255
+      // ── Engine load  A*100/255 ────────────────────────────────────────────
       case 0x04:
         buf[0] = (uint8_t)(p.load * 255.0f / 100.0f);
         return 1;
 
-      // Coolant temp  A-40
+      // ── Coolant temperature  A-40 °C ──────────────────────────────────────
       case 0x05:
         buf[0] = (uint8_t)(p.coolant + 40.0f);
         return 1;
 
-      // Short-term fuel trim  (A-128)*100/128
+      // ── Short-term fuel trim  (A-128)*100/128 ─────────────────────────────
       case 0x06:
         buf[0] = (uint8_t)((p.fuelTrim * 128.0f / 100.0f) + 128.0f);
         return 1;
 
-      // Long-term fuel trim  0%
+      // ── Long-term fuel trim  (fixed 0%) ───────────────────────────────────
       case 0x07:
         buf[0] = 128;
         return 1;
 
-      // MAP absolute pressure  A kPa
+      // ── MAP absolute pressure  A kPa ──────────────────────────────────────
+      // This is the primary boost/vacuum sensor.
+      // 101 kPa = atmospheric, >101 = boost, <101 = vacuum
       case 0x0B:
-        buf[0] = (uint8_t)(p.map_kpa);
+        buf[0] = (uint8_t)constrain(p.map_kpa, 0, 255);
         return 1;
 
-      // Engine RPM  (256A+B)/4
+      // ── Engine RPM  (256A+B)/4 ────────────────────────────────────────────
       case 0x0C: {
         uint16_t raw = (uint16_t)(p.rpm * 4.0f);
         buf[0] = (raw >> 8) & 0xFF;
@@ -191,22 +244,22 @@ int simulatePID(uint8_t service, uint8_t pid, uint8_t *buf) {
         return 2;
       }
 
-      // Vehicle speed  A km/h
+      // ── Vehicle speed  A km/h ─────────────────────────────────────────────
       case 0x0D:
-        buf[0] = (uint8_t)(p.speed);
+        buf[0] = (uint8_t)constrain(p.speed, 0, 255);
         return 1;
 
-      // Timing advance  A/2-64
+      // ── Timing advance  A/2-64 degrees ───────────────────────────────────
       case 0x0E:
-        buf[0] = (uint8_t)((p.timing + 64.0f) * 2.0f);
+        buf[0] = (uint8_t)((timing + 64.0f) * 2.0f);
         return 1;
 
-      // Intake air temp  A-40
+      // ── Intake air temperature  A-40 °C ───────────────────────────────────
       case 0x0F:
         buf[0] = (uint8_t)(p.intake + 40.0f);
         return 1;
 
-      // MAF  (256A+B)/100
+      // ── MAF air flow  (256A+B)/100 g/s ───────────────────────────────────
       case 0x10: {
         uint16_t raw = (uint16_t)(p.maf * 100.0f);
         buf[0] = (raw >> 8) & 0xFF;
@@ -214,17 +267,17 @@ int simulatePID(uint8_t service, uint8_t pid, uint8_t *buf) {
         return 2;
       }
 
-      // Throttle position  A*100/255
+      // ── Throttle position  A*100/255 % ───────────────────────────────────
       case 0x11:
         buf[0] = (uint8_t)(p.throttle * 255.0f / 100.0f);
         return 1;
 
-      // OBD standard
+      // ── OBD standard  (EOBD) ─────────────────────────────────────────────
       case 0x1C:
         buf[0] = 0x06;
         return 1;
 
-      // Runtime since start (seconds)
+      // ── Runtime since engine start (seconds) ──────────────────────────────
       case 0x1F: {
         uint16_t s = (uint16_t)(millis() / 1000);
         buf[0] = (s >> 8) & 0xFF;
@@ -232,27 +285,32 @@ int simulatePID(uint8_t service, uint8_t pid, uint8_t *buf) {
         return 2;
       }
 
-      // Supported PIDs 0x21–0x40
+      // ── Supported PIDs 0x21–0x40 ─────────────────────────────────────────
       case 0x20:
-        buf[0]=0x80; buf[1]=0x00; buf[2]=0x00; buf[3]=0x01;
+        buf[0]=0xA0; buf[1]=0x00; buf[2]=0x20; buf[3]=0x01;
         return 4;
 
-      // Distance with MIL on
+      // ── Distance with MIL on (0 km) ───────────────────────────────────────
       case 0x21:
         buf[0]=0x00; buf[1]=0x00;
         return 2;
 
-      // Fuel tank level  A*100/255 %
+      // ── Fuel tank level  A*100/255 % ─────────────────────────────────────
       case 0x2F:
-        buf[0] = (uint8_t)(0.65f * 255.0f);   // 65%
+        buf[0] = (uint8_t)(p.fuel_pct * 255.0f / 100.0f);
         return 1;
 
-      // Barometric pressure
+      // ── Barometric pressure  A kPa ────────────────────────────────────────
       case 0x33:
         buf[0] = 101;
         return 1;
 
-      // Control module voltage  (256A+B)/1000
+      // ── Supported PIDs 0x41–0x60 ─────────────────────────────────────────
+      case 0x40:
+        buf[0]=0x44; buf[1]=0x00; buf[2]=0x00; buf[3]=0x01;
+        return 4;
+
+      // ── Control module voltage  (256A+B)/1000 V ───────────────────────────
       case 0x42: {
         uint16_t raw = (uint16_t)(p.voltage * 1000.0f);
         buf[0] = (raw >> 8) & 0xFF;
@@ -260,20 +318,51 @@ int simulatePID(uint8_t service, uint8_t pid, uint8_t *buf) {
         return 2;
       }
 
-      // Ambient air temperature
-      case 0x46:
-        buf[0] = (uint8_t)(28.0f + 40.0f);
+      // ── Absolute throttle position B (redundant sensor) ───────────────────
+      case 0x47:
+        buf[0] = (uint8_t)(p.throttle * 255.0f / 100.0f);
         return 1;
 
-      // Fuel type – gasoline
+      // ── Ambient air temperature  A-40 °C ──────────────────────────────────
+      case 0x46:
+        buf[0] = (uint8_t)(22.0f + 40.0f);   // fixed 22°C ambient
+        return 1;
+
+      // ── Fuel type – gasoline ──────────────────────────────────────────────
       case 0x51:
         buf[0] = 0x01;
         return 1;
 
-      // Oil temperature  A-40
+      // ── Engine oil temperature  A-40 °C ───────────────────────────────────
       case 0x5C:
-        buf[0] = (uint8_t)((p.coolant - 5.0f) + 40.0f);
+        buf[0] = (uint8_t)((p.coolant - 8.0f) + 40.0f);
         return 1;
+
+      // ── Relative throttle position  A*100/255 % ───────────────────────────
+      case 0x45:
+        buf[0] = (uint8_t)(p.throttle * 255.0f / 100.0f);
+        return 1;
+
+      // ── Boost pressure (Turbo / Supercharger) ─────────────────────────────
+      // PID 0x70 – Boost pressure control. A = boost in kPa above atmos * 2
+      // Used by Car Scanner, Torque Pro for boost gauge.
+      // Formula: (A * 3) - 101  kPa  → we encode boost_kpa as (boost_kpa+101)/3
+      case 0x70: {
+        // Encode as signed kPa relative: (A-128)*0.5 kPa per bit
+        int16_t raw = (int16_t)((boost_kpa + 128.0f) * 2.0f);
+        if (raw < 0)   raw = 0;
+        if (raw > 255) raw = 255;
+        buf[0] = (uint8_t)raw;
+        return 1;
+      }
+
+      // ── Transmission gear (PID 0xA4) ──────────────────────────────────────
+      // PID 0xA4 – Transmission actual gear.
+      // Formula: A = gear number (0=neutral/park, 1–8 = gears)
+      case 0xA4:
+        buf[0] = gear;
+        buf[1] = 0x00;
+        return 2;
 
       default:
         return -1;
@@ -281,19 +370,16 @@ int simulatePID(uint8_t service, uint8_t pid, uint8_t *buf) {
 
   } else if (service == 0x09) {
     switch (pid) {
-
-      // VIN message count + first 5 chars
+      // VIN message count + first chars
       case 0x02:
         buf[0]=0x01;
-        buf[1]='1'; buf[2]='H'; buf[3]='G'; buf[4]='B'; buf[5]='H';
+        buf[1]='W'; buf[2]='V'; buf[3]='W'; buf[4]='Z'; buf[5]='Z';
         return 6;
-
       // Calibration ID
       case 0x04:
         buf[0]=0x01;
         buf[1]='E'; buf[2]='S'; buf[3]='P'; buf[4]='3'; buf[5]='2';
         return 6;
-
       default:
         return -1;
     }
@@ -544,7 +630,7 @@ void processCommand(String cmd) {
 void setup() {
   Serial.begin(115200);
   Serial.println("[ESP32 ELM327 Emulator] Starting...");
-  Serial.println(USE_REAL_CAN ? "[MODE] Real CAN bus" : "[MODE] 30s simulated driving profile");
+  Serial.println(USE_REAL_CAN ? "[MODE] Real CAN bus" : "[MODE] 10-min simulated driving profile");
 
   // Print Bluetooth MAC address (available before BT stack starts)
   uint8_t mac[6];
