@@ -127,50 +127,37 @@ uint8_t  protocol    = 6;    // 6 = ISO 15765-4 CAN 11-bit 500kbps
 uint32_t obdHeader   = 0x7DF;
 
 // ─── No-Response Freeze Simulation ───────────────────────────────────────────
-// When enabled, the adapter goes silent (no OBD response) for FREEZE_DURATION_MS
-// once per minute, triggered at the 2-minute mark of the trip cycle and every
-// FREEZE_INTERVAL_SEC seconds after that.
-// Set FREEZE_ENABLED false to disable entirely without removing the code.
-#define FREEZE_ENABLED        true    // master on/off flag
-#define FREEZE_DURATION_MS    1500    // silence window in milliseconds
-#define FREEZE_OFFSET_SEC     60     // first trigger at t=120s (2 min into cycle)
-#define FREEZE_INTERVAL_SEC   60      // repeat every 60 s after the first trigger
+// Controlled manually from the Arduino Serial Monitor:
+//   Type "F11" + Enter  →  activate freeze (adapter goes silent indefinitely)
+//   Type "F10" + Enter  →  deactivate freeze (adapter responds normally)
+// While active, all OBD2 PID requests are silently dropped until F10 is sent.
 
-bool     freezeActive  = false;       // true while adapter is frozen
-uint32_t freezeStartMs = 0;           // millis() when current freeze began
+bool   freezeActive = false;   // true while adapter is frozen
+String serialBuffer = "";      // input buffer for Serial Monitor commands
 
-// ─── Freeze Trigger Logic ─────────────────────────────────────────────────────
-// Call this every loop iteration. Sets freezeActive=true for FREEZE_DURATION_MS
-// at t=FREEZE_OFFSET_SEC and then every FREEZE_INTERVAL_SEC within the cycle.
+// ─── Serial Monitor Command Handler ──────────────────────────────────────────
+void handleSerialCommand(String cmd) {
+  cmd.trim();
+  cmd.toUpperCase();
+
+  if (cmd == "F11") {
+    freezeActive = true;
+    Serial.println("[FREEZE] ON  — no-response active until F10");
+  }
+  else if (cmd == "F10") {
+    freezeActive = false;
+    Serial.println("[FREEZE] OFF — adapter responding normally");
+  }
+  else {
+    Serial.println("[CMD] Unknown command: " + cmd);
+    Serial.println("[CMD] Use F11 to freeze, F10 to unfreeze");
+  }
+}
+
+// ─── Freeze Expiry Check ──────────────────────────────────────────────────────
+// Freeze stays active until F10 is sent. No auto-expiry.
 void checkFreeze() {
-#if FREEZE_ENABLED
-  // Expire active freeze
-  if (freezeActive) {
-    if (millis() - freezeStartMs >= FREEZE_DURATION_MS) {
-      freezeActive = false;
-      Serial.println("[FREEZE] Freeze ended");
-    }
-    return;  // don't re-trigger while still frozen
-  }
-
-  // Calculate position within cycle
-  uint32_t cycleMs      = (uint32_t)(CYCLE_SECONDS * 1000UL);
-  uint32_t posMs        = millis() % cycleMs;
-  uint32_t offsetMs     = (uint32_t)(FREEZE_OFFSET_SEC)  * 1000UL;
-  uint32_t intervalMs   = (uint32_t)(FREEZE_INTERVAL_SEC) * 1000UL;
-
-  // posMs relative to first trigger
-  if (posMs >= offsetMs) {
-    uint32_t sinceTrigger = (posMs - offsetMs) % intervalMs;
-    // Trigger within first 100ms of each interval slot to avoid re-firing
-    if (sinceTrigger < 100) {
-      freezeActive  = true;
-      freezeStartMs = millis();
-      Serial.println("[FREEZE] Freeze started (no-response for "
-                     + String(FREEZE_DURATION_MS) + "ms)");
-    }
-  }
-#endif
+  // intentionally empty — freeze is only cleared by F10 command
 }
 
 // ─── Interpolation ───────────────────────────────────────────────────────────
@@ -698,6 +685,7 @@ void setup() {
   SerialBT.setPin("1234", 4);
   SerialBT.begin(BT_DEVICE_NAME);
   Serial.println("[BT] Device: " + String(BT_DEVICE_NAME) + "  PIN: 1234");
+  Serial.println("[INFO] Serial commands: F11 = freeze ON  |  F10 = freeze OFF");
 
 #if USE_REAL_CAN
   if (canInit()) Serial.println("[CAN] TWAI started @ 500kbps");
@@ -720,9 +708,23 @@ void loop() {
     Serial.println("[BT] Client disconnected");
   }
 
-  // Update freeze simulation state
+  // Update freeze expiry
   checkFreeze();
 
+  // ── Read Serial Monitor commands (F11 / F10) ─────────────────────────────
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\r' || c == '\n') {
+      if (serialBuffer.length() > 0) {
+        handleSerialCommand(serialBuffer);
+        serialBuffer = "";
+      }
+    } else {
+      serialBuffer += c;
+    }
+  }
+
+  // ── Read Bluetooth OBD commands ───────────────────────────────────────────
   while (SerialBT.available()) {
     char c = SerialBT.read();
     if (c == '\r' || c == '\n') {
