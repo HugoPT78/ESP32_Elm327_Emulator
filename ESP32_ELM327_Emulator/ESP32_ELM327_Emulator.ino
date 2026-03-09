@@ -126,38 +126,56 @@ bool     spacesOn    = true;
 uint8_t  protocol    = 6;    // 6 = ISO 15765-4 CAN 11-bit 500kbps
 uint32_t obdHeader   = 0x7DF;
 
-// ─── No-Response Freeze Simulation ───────────────────────────────────────────
-// Controlled manually from the Arduino Serial Monitor:
-//   Type "F11" + Enter  →  activate freeze (adapter goes silent indefinitely)
-//   Type "F10" + Enter  →  deactivate freeze (adapter responds normally)
-// While active, all OBD2 PID requests are silently dropped until F10 is sent.
+// ─── Freeze Simulation ────────────────────────────────────────────────────────
+// Controlled from Arduino Serial Monitor. Send command + Enter:
+//
+//   F10  → OFF            — adapter responds normally
+//   F11  → NO DATA        — responds with "NO DATA", BT stays connected  (default)
+//   F12  → SILENT DROP    — no response at all, app times out + disconnects
+//   F13  → UNABLE TO CONNECT — sends "UNABLE TO CONNECT", BT stays connected
+//
+// Default freeze mode on startup is F11 (NO DATA).
 
-bool   freezeActive = false;   // true while adapter is frozen
-String serialBuffer = "";      // input buffer for Serial Monitor commands
+enum FreezeMode {
+  FREEZE_OFF     = 0,   // F10 – normal operation
+  FREEZE_NODATA  = 1,   // F11 – reply "NO DATA"         (BT stays alive)
+  FREEZE_SILENT  = 2,   // F12 – silent drop              (app disconnects)
+  FREEZE_UNABLE  = 3    // F13 – reply "UNABLE TO CONNECT" (BT stays alive)
+};
+
+FreezeMode freezeMode  = FREEZE_NODATA;  // default: F11 on startup
+String     serialBuffer = "";            // Serial Monitor input buffer
 
 // ─── Serial Monitor Command Handler ──────────────────────────────────────────
 void handleSerialCommand(String cmd) {
   cmd.trim();
   cmd.toUpperCase();
 
-  if (cmd == "F11") {
-    freezeActive = true;
-    Serial.println("[FREEZE] ON  — no-response active until F10");
+  if (cmd == "F10") {
+    freezeMode = FREEZE_OFF;
+    Serial.println("[FREEZE] F10 — OFF: adapter responding normally");
   }
-  else if (cmd == "F10") {
-    freezeActive = false;
-    Serial.println("[FREEZE] OFF — adapter responding normally");
+  else if (cmd == "F11") {
+    freezeMode = FREEZE_NODATA;
+    Serial.println("[FREEZE] F11 — NO DATA: BT alive, sending NO DATA");
+  }
+  else if (cmd == "F12") {
+    freezeMode = FREEZE_SILENT;
+    Serial.println("[FREEZE] F12 — SILENT: requests dropped, app will disconnect");
+  }
+  else if (cmd == "F13") {
+    freezeMode = FREEZE_UNABLE;
+    Serial.println("[FREEZE] F13 — UNABLE TO CONNECT: BT alive, sending UNABLE TO CONNECT");
   }
   else {
-    Serial.println("[CMD] Unknown command: " + cmd);
-    Serial.println("[CMD] Use F11 to freeze, F10 to unfreeze");
+    Serial.println("[CMD] Unknown: " + cmd);
+    Serial.println("[CMD] F10=OFF  F11=NO DATA  F12=SILENT DROP  F13=UNABLE TO CONNECT");
   }
 }
 
-// ─── Freeze Expiry Check ──────────────────────────────────────────────────────
-// Freeze stays active until F10 is sent. No auto-expiry.
+// ─── Freeze Check (no auto-expiry — stays until F10) ─────────────────────────
 void checkFreeze() {
-  // intentionally empty — freeze is only cleared by F10 command
+  // intentionally empty — mode only changes via Serial commands
 }
 
 // ─── Interpolation ───────────────────────────────────────────────────────────
@@ -631,12 +649,23 @@ void handleOBD(String cmd) {
   cmd.trim();
   if (cmd.length() < 4) { btPrint("NO DATA"); return; }
 
-  // ── Freeze: return no response for FREEZE_DURATION_MS ─────────────────────
-  if (freezeActive) {
-    // Silently drop the request — no response at all, exactly like a real
-    // timeout from a non-responding ECU. The app will time out on its side.
-    Serial.println("[FREEZE] Dropped request: " + cmd);
-    return;
+  // ── Freeze mode check ────────────────────────────────────────────────────
+  if (freezeMode != FREEZE_OFF) {
+    switch (freezeMode) {
+      case FREEZE_NODATA:
+        Serial.println("[FREEZE-F11] NO DATA → " + cmd);
+        btPrint("NO DATA");
+        return;
+      case FREEZE_SILENT:
+        Serial.println("[FREEZE-F12] SILENT DROP → " + cmd);
+        return;  // no response — app will time out and disconnect
+      case FREEZE_UNABLE:
+        Serial.println("[FREEZE-F13] UNABLE TO CONNECT → " + cmd);
+        btPrint("UNABLE TO CONNECT");
+        return;
+      default:
+        break;
+    }
   }
 
   uint8_t service = (uint8_t)strtol(cmd.substring(0, 2).c_str(), nullptr, 16);
@@ -685,7 +714,7 @@ void setup() {
   SerialBT.setPin("1234", 4);
   SerialBT.begin(BT_DEVICE_NAME);
   Serial.println("[BT] Device: " + String(BT_DEVICE_NAME) + "  PIN: 1234");
-  Serial.println("[INFO] Serial commands: F11 = freeze ON  |  F10 = freeze OFF");
+  Serial.println("[INFO] Serial: F10=OFF  F11=NO DATA(default)  F12=SILENT  F13=UNABLE TO CONNECT");
 
 #if USE_REAL_CAN
   if (canInit()) Serial.println("[CAN] TWAI started @ 500kbps");
