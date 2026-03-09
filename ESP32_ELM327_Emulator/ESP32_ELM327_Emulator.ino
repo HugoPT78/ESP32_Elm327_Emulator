@@ -126,6 +126,53 @@ bool     spacesOn    = true;
 uint8_t  protocol    = 6;    // 6 = ISO 15765-4 CAN 11-bit 500kbps
 uint32_t obdHeader   = 0x7DF;
 
+// ─── No-Response Freeze Simulation ───────────────────────────────────────────
+// When enabled, the adapter goes silent (no OBD response) for FREEZE_DURATION_MS
+// once per minute, triggered at the 2-minute mark of the trip cycle and every
+// FREEZE_INTERVAL_SEC seconds after that.
+// Set FREEZE_ENABLED false to disable entirely without removing the code.
+#define FREEZE_ENABLED        true    // master on/off flag
+#define FREEZE_DURATION_MS    1500    // silence window in milliseconds
+#define FREEZE_OFFSET_SEC     120     // first trigger at t=120s (2 min into cycle)
+#define FREEZE_INTERVAL_SEC   60      // repeat every 60 s after the first trigger
+
+bool     freezeActive  = false;       // true while adapter is frozen
+uint32_t freezeStartMs = 0;           // millis() when current freeze began
+
+// ─── Freeze Trigger Logic ─────────────────────────────────────────────────────
+// Call this every loop iteration. Sets freezeActive=true for FREEZE_DURATION_MS
+// at t=FREEZE_OFFSET_SEC and then every FREEZE_INTERVAL_SEC within the cycle.
+void checkFreeze() {
+#if FREEZE_ENABLED
+  // Expire active freeze
+  if (freezeActive) {
+    if (millis() - freezeStartMs >= FREEZE_DURATION_MS) {
+      freezeActive = false;
+      Serial.println("[FREEZE] Freeze ended");
+    }
+    return;  // don't re-trigger while still frozen
+  }
+
+  // Calculate position within cycle
+  uint32_t cycleMs      = (uint32_t)(CYCLE_SECONDS * 1000UL);
+  uint32_t posMs        = millis() % cycleMs;
+  uint32_t offsetMs     = (uint32_t)(FREEZE_OFFSET_SEC)  * 1000UL;
+  uint32_t intervalMs   = (uint32_t)(FREEZE_INTERVAL_SEC) * 1000UL;
+
+  // posMs relative to first trigger
+  if (posMs >= offsetMs) {
+    uint32_t sinceTrigger = (posMs - offsetMs) % intervalMs;
+    // Trigger within first 100ms of each interval slot to avoid re-firing
+    if (sinceTrigger < 100) {
+      freezeActive  = true;
+      freezeStartMs = millis();
+      Serial.println("[FREEZE] Freeze started (no-response for "
+                     + String(FREEZE_DURATION_MS) + "ms)");
+    }
+  }
+#endif
+}
+
 // ─── Interpolation ───────────────────────────────────────────────────────────
 
 float lerpf(float a, float b, float t) { return a + (b - a) * t; }
@@ -597,6 +644,14 @@ void handleOBD(String cmd) {
   cmd.trim();
   if (cmd.length() < 4) { btPrint("NO DATA"); return; }
 
+  // ── Freeze: return no response for FREEZE_DURATION_MS ─────────────────────
+  if (freezeActive) {
+    // Silently drop the request — no response at all, exactly like a real
+    // timeout from a non-responding ECU. The app will time out on its side.
+    Serial.println("[FREEZE] Dropped request: " + cmd);
+    return;
+  }
+
   uint8_t service = (uint8_t)strtol(cmd.substring(0, 2).c_str(), nullptr, 16);
   uint8_t pid     = (uint8_t)strtol(cmd.substring(2, 4).c_str(), nullptr, 16);
 
@@ -664,6 +719,9 @@ void loop() {
     inputBuffer = "";
     Serial.println("[BT] Client disconnected");
   }
+
+  // Update freeze simulation state
+  checkFreeze();
 
   while (SerialBT.available()) {
     char c = SerialBT.read();
