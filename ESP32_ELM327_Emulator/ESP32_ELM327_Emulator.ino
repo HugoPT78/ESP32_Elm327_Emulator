@@ -133,7 +133,7 @@ uint32_t obdHeader   = 0x7DF;
 // Set FREEZE_ENABLED false to disable entirely without removing the code.
 #define FREEZE_ENABLED        true    // master on/off flag
 #define FREEZE_DURATION_MS    1500    // silence window in milliseconds
-#define FREEZE_OFFSET_SEC     120     // first trigger at t=120s (2 min into cycle)
+#define FREEZE_OFFSET_SEC     60     // first trigger at t=120s (2 min into cycle)
 #define FREEZE_INTERVAL_SEC   60      // repeat every 60 s after the first trigger
 
 bool     freezeActive  = false;       // true while adapter is frozen
