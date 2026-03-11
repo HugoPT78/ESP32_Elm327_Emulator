@@ -1,3 +1,5 @@
+# ESP32_ELM327_Emulator.ino
+
 /**
  * ESP32 ELM327 v2.1 Bluetooth Emulator
  * — Simulated OBD2 Data Mode —
@@ -143,7 +145,7 @@ enum FreezeMode {
   FREEZE_UNABLE  = 3    // F13 – reply "UNABLE TO CONNECT" (BT stays alive)
 };
 
-FreezeMode freezeMode  = FREEZE_OFF;  // default: F11 on startup
+FreezeMode freezeMode  = FREEZE_NODATA;  // default: F11 on startup
 String     serialBuffer = "";            // Serial Monitor input buffer
 
 // ─── Serial Monitor Command Handler ──────────────────────────────────────────
@@ -768,3 +770,7 @@ void loop() {
     }
   }
 }
+
+
+---
+
