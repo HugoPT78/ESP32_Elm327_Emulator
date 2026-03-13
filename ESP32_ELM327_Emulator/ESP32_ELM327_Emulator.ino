@@ -129,22 +129,31 @@ uint32_t obdHeader   = 0x7DF;
 // ─── Freeze Simulation ────────────────────────────────────────────────────────
 // Controlled from Arduino Serial Monitor. Send command + Enter:
 //
-//   F10  → OFF            — adapter responds normally
-//   F11  → NO DATA        — responds with "NO DATA", BT stays connected  (default)
-//   F12  → SILENT DROP    — no response at all, app times out + disconnects
+//   F10  → OFF              — adapter responds normally
+//   F11  → NO DATA          — responds with "NO DATA", BT stays connected (default)
+//   F12  → SILENT DROP      — no response at all, app times out + disconnects
 //   F13  → UNABLE TO CONNECT — sends "UNABLE TO CONNECT", BT stays connected
+//   F14  → RANDOM TIMEOUT   — randomly silently drops 3 consecutive requests
+//                             for a randomly chosen PID, then resumes normally.
+//                             Simulates intermittent signal loss per sensor.
 //
 // Default freeze mode on startup is F11 (NO DATA).
 
 enum FreezeMode {
-  FREEZE_OFF     = 0,   // F10 – normal operation
-  FREEZE_NODATA  = 1,   // F11 – reply "NO DATA"         (BT stays alive)
-  FREEZE_SILENT  = 2,   // F12 – silent drop              (app disconnects)
-  FREEZE_UNABLE  = 3    // F13 – reply "UNABLE TO CONNECT" (BT stays alive)
+  FREEZE_OFF         = 0,   // F10 – normal operation
+  FREEZE_NODATA      = 1,   // F11 – reply "NO DATA"            (BT stays alive)
+  FREEZE_SILENT      = 2,   // F12 – silent drop                (app disconnects)
+  FREEZE_UNABLE      = 3,   // F13 – reply "UNABLE TO CONNECT"  (BT stays alive)
+  FREEZE_RANDTIMEOUT = 4    // F14 – random 3x silent drop on one PID
 };
 
-FreezeMode freezeMode  = FREEZE_OFF;  // default: F11 on startup
+FreezeMode freezeMode  = FREEZE_NODATA;  // default: F11 on startup
 String     serialBuffer = "";            // Serial Monitor input buffer
+
+// F14 state — tracks which PID is being timed out and how many drops remain
+uint8_t  f14TargetPid    = 0xFF;   // PID currently being dropped (0xFF = none chosen yet)
+uint8_t  f14DropsLeft    = 0;      // remaining silent drops for this PID burst
+uint32_t f14NextTriggerMs = 0;     // earliest time the next burst can start
 
 // ─── Serial Monitor Command Handler ──────────────────────────────────────────
 void handleSerialCommand(String cmd) {
@@ -167,9 +176,16 @@ void handleSerialCommand(String cmd) {
     freezeMode = FREEZE_UNABLE;
     Serial.println("[FREEZE] F13 — UNABLE TO CONNECT: BT alive, sending UNABLE TO CONNECT");
   }
+  else if (cmd == "F14") {
+    freezeMode       = FREEZE_RANDTIMEOUT;
+    f14TargetPid     = 0xFF;   // no burst active yet — will pick randomly on next PID hit
+    f14DropsLeft     = 0;
+    f14NextTriggerMs = 0;      // allow first burst immediately
+    Serial.println("[FREEZE] F14 — RANDOM TIMEOUT: will silently drop 3x same PID randomly");
+  }
   else {
     Serial.println("[CMD] Unknown: " + cmd);
-    Serial.println("[CMD] F10=OFF  F11=NO DATA  F12=SILENT DROP  F13=UNABLE TO CONNECT");
+    Serial.println("[CMD] F10=OFF  F11=NO DATA  F12=SILENT  F13=UNABLE  F14=RANDOM TIMEOUT");
   }
 }
 
@@ -652,17 +668,57 @@ void handleOBD(String cmd) {
   // ── Freeze mode check ────────────────────────────────────────────────────
   if (freezeMode != FREEZE_OFF) {
     switch (freezeMode) {
+
       case FREEZE_NODATA:
         Serial.println("[FREEZE-F11] NO DATA → " + cmd);
         btPrint("NO DATA");
         return;
+
       case FREEZE_SILENT:
         Serial.println("[FREEZE-F12] SILENT DROP → " + cmd);
-        return;  // no response — app will time out and disconnect
+        return;
+
       case FREEZE_UNABLE:
         Serial.println("[FREEZE-F13] UNABLE TO CONNECT → " + cmd);
         btPrint("UNABLE TO CONNECT");
         return;
+
+      case FREEZE_RANDTIMEOUT: {
+        // Parse the PID from this request
+        uint8_t reqPid = (uint8_t)strtol(cmd.substring(2, 4).c_str(), nullptr, 16);
+
+        // ── Start a new burst if none is active and enough time has passed ──
+        if (f14DropsLeft == 0 && millis() >= f14NextTriggerMs) {
+          // Pick this PID as the target randomly (~30% chance per PID request)
+          if (random(0, 100) < 30) {
+            f14TargetPid = reqPid;
+            f14DropsLeft = 3;
+            Serial.println("[FREEZE-F14] New burst: PID 0x"
+                           + String(f14TargetPid, HEX)
+                           + " will be silently dropped 3x");
+          }
+        }
+
+        // ── Drop silently if this request matches the active burst PID ──────
+        if (f14DropsLeft > 0 && reqPid == f14TargetPid) {
+          f14DropsLeft--;
+          Serial.println("[FREEZE-F14] Silent drop PID 0x"
+                         + String(reqPid, HEX)
+                         + " — drops left: " + String(f14DropsLeft));
+          if (f14DropsLeft == 0) {
+            // Burst complete — wait 3–8 seconds before allowing a new one
+            f14NextTriggerMs = millis() + (uint32_t)random(3000, 8000);
+            f14TargetPid     = 0xFF;
+            Serial.println("[FREEZE-F14] Burst complete. Next burst in ~"
+                           + String((f14NextTriggerMs - millis()) / 1000) + "s");
+          }
+          return;  // silent drop — no response sent
+        }
+
+        // All other PIDs respond normally during F14 mode
+        break;
+      }
+
       default:
         break;
     }
@@ -700,6 +756,7 @@ void processCommand(String cmd) {
 
 void setup() {
   Serial.begin(115200);
+  randomSeed(esp_random());   // seed RNG from hardware entropy (for F14)
   Serial.println("[ESP32 ELM327 Emulator] Starting...");
   Serial.println(USE_REAL_CAN ? "[MODE] Real CAN bus" : "[MODE] 10-min simulated driving profile");
 
@@ -714,7 +771,7 @@ void setup() {
   SerialBT.setPin("1234", 4);
   SerialBT.begin(BT_DEVICE_NAME);
   Serial.println("[BT] Device: " + String(BT_DEVICE_NAME) + "  PIN: 1234");
-  Serial.println("[INFO] Serial: F10=OFF  F11=NO DATA(default)  F12=SILENT  F13=UNABLE TO CONNECT");
+  Serial.println("[INFO] Serial: F10=OFF  F11=NO DATA(default)  F12=SILENT  F13=UNABLE  F14=RANDOM TIMEOUT");
 
 #if USE_REAL_CAN
   if (canInit()) Serial.println("[CAN] TWAI started @ 500kbps");
