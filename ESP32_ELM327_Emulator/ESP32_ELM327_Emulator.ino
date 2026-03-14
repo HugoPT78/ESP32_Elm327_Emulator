@@ -438,16 +438,36 @@ int simulatePID(uint8_t service, uint8_t pid, uint8_t *buf) {
 
   } else if (service == 0x09) {
     switch (pid) {
-      // VIN message count + first chars
-      case 0x02:
-        buf[0]=0x01;
-        buf[1]='W'; buf[2]='V'; buf[3]='W'; buf[4]='Z'; buf[5]='Z';
+
+      // ── VIN – BMW E36 Compact 316i ────────────────────────────────────────
+      // Full VIN: WBABG910XTJD12345  (17 chars)
+      //
+      // Breakdown:
+      //   WBA        – BMW AG, Germany
+      //   BG91       – E36/5 Compact, 316i (M43B16 engine)
+      //   0          – Restraint: seat belts only
+      //   X          – Check digit
+      //   T          – Model year 1996
+      //   J          – Munich plant
+      //   D12345     – Sequential serial number
+      //
+      // OBD2 Service 09 PID 02 encodes VIN as:
+      //   byte 0 = number of data items (0x01)
+      //   bytes 1–5 = first 5 chars of VIN (remaining chars handled by ISO-TP
+      //               multi-frame in a real ECU; single-frame gives prefix)
+      case 0x02: {
+        const char vin[] = "WBABG910XTJD12345";
+        buf[0] = 0x01;                    // 1 data item
+        for (int i = 0; i < 5; i++) buf[i + 1] = (uint8_t)vin[i];
         return 6;
-      // Calibration ID
+      }
+
+      // ── ECU / Calibration ID ──────────────────────────────────────────────
       case 0x04:
         buf[0]=0x01;
-        buf[1]='E'; buf[2]='S'; buf[3]='P'; buf[4]='3'; buf[5]='2';
+        buf[1]='M'; buf[2]='4'; buf[3]='3'; buf[4]='B'; buf[5]='1';
         return 6;
+
       default:
         return -1;
     }
