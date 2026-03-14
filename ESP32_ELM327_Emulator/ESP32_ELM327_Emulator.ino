@@ -439,33 +439,14 @@ int simulatePID(uint8_t service, uint8_t pid, uint8_t *buf) {
   } else if (service == 0x09) {
     switch (pid) {
 
-      // ── VIN – BMW E36 Compact 316i ────────────────────────────────────────
-      // Full VIN: WBABG910XTJD12345  (17 chars)
-      //
-      // Breakdown:
-      //   WBA        – BMW AG, Germany
-      //   BG91       – E36/5 Compact, 316i (M43B16 engine)
-      //   0          – Restraint: seat belts only
-      //   X          – Check digit
-      //   T          – Model year 1996
-      //   J          – Munich plant
-      //   D12345     – Sequential serial number
-      //
-      // OBD2 Service 09 PID 02 encodes VIN as:
-      //   byte 0 = number of data items (0x01)
-      //   bytes 1–5 = first 5 chars of VIN (remaining chars handled by ISO-TP
-      //               multi-frame in a real ECU; single-frame gives prefix)
-      case 0x02: {
-        const char vin[] = "WBABG910XTJD12345";
-        buf[0] = 0x01;                    // 1 data item
-        for (int i = 0; i < 5; i++) buf[i + 1] = (uint8_t)vin[i];
-        return 6;
-      }
+      // ── VIN – handled by sendVIN() in handleOBD, should not reach here ────
+      case 0x02:
+        return -1;
 
-      // ── ECU / Calibration ID ──────────────────────────────────────────────
+      // ── ECU / Calibration ID – 1.4 TDCi Duratorq ─────────────────────────
       case 0x04:
         buf[0]=0x01;
-        buf[1]='M'; buf[2]='4'; buf[3]='3'; buf[4]='B'; buf[5]='1';
+        buf[1]='F'; buf[2]='8'; buf[3]='A'; buf[4]='F'; buf[5]='B';
         return 6;
 
       default:
@@ -679,6 +660,72 @@ void handleAT(String cmd) {
   btPrint("OK");
 }
 
+// ─── Full ISO-TP VIN Response (Service 09 PID 02) ────────────────────────────
+//
+// A 17-char VIN cannot fit in a single OBD frame (max 5 data bytes after
+// service+pid+count). The ELM327 sends it as a multi-line ASCII response,
+// one line per CAN frame, exactly as a real adapter does.
+//
+// Wire format (headers OFF, spaces ON — most common app config):
+//
+//   010                     ← First Frame PCI (0x10), length=20 (0x14)
+//   49 02 01 W  F  0  F  X  ← svc, pid, count, VIN[0..4]
+//   021                     ← Consecutive Frame 1 (0x21)
+//   X  G  A  J  F  9  A  1  ← VIN[5..12]
+//   022                     ← Consecutive Frame 2 (0x22)
+//   2  3  4  5  00 00 00    ← VIN[13..16] + padding
+//
+// With headers ON (ATH1) each line is prefixed with "7E8 " + byte count.
+//
+// The ELM327 also sends a flow-control acknowledgement line "SEARCHING..."
+// is NOT sent here — that only happens during ATSP auto-detect.
+
+void sendVIN() {
+  const char vin[]  = "WF0FXXGAJF9A12345";  // Ford Fiesta Mk6 1.4 TDCi 2009
+  const uint8_t vinLen = 17;
+
+  // Build the 20-byte ISO-TP payload:
+  //   byte 0   = 0x49  (response to service 09)
+  //   byte 1   = 0x02  (PID)
+  //   byte 2   = 0x01  (number of data items)
+  //   bytes 3–19 = VIN characters
+  uint8_t payload[20];
+  payload[0] = 0x49;
+  payload[1] = 0x02;
+  payload[2] = 0x01;
+  for (int i = 0; i < vinLen; i++) payload[3 + i] = (uint8_t)vin[i];
+
+  // ── Frame 1: First Frame  PCI=0x10, total length=20 (0x14) ──────────────
+  // Contains payload bytes 0..5  (6 bytes after 2-byte PCI)
+  String f1 = "";
+  if (headersOn) f1 += "7E8 ";
+  f1 += "10 14";                             // FF PCI + length
+  for (int i = 0; i < 6; i++)
+    f1 += sp() + hexByte(payload[i]);
+  SerialBT.print(f1);
+  SerialBT.print(linefeedOn ? "\r\n" : "\r");
+
+  // ── Frame 2: Consecutive Frame 1  PCI=0x21 ───────────────────────────────
+  // Contains payload bytes 6..12  (7 bytes)
+  String f2 = "";
+  if (headersOn) f2 += "7E8 ";
+  f2 += "21";
+  for (int i = 6; i < 13; i++)
+    f2 += sp() + hexByte(payload[i]);
+  SerialBT.print(f2);
+  SerialBT.print(linefeedOn ? "\r\n" : "\r");
+
+  // ── Frame 3: Consecutive Frame 2  PCI=0x22 ───────────────────────────────
+  // Contains payload bytes 13..19 (7 bytes, last 4 are 0x00 padding)
+  String f3 = "";
+  if (headersOn) f3 += "7E8 ";
+  f3 += "22";
+  for (int i = 13; i < 20; i++)
+    f3 += sp() + hexByte(payload[i]);
+  SerialBT.print(f3);
+  SerialBT.print(linefeedOn ? "\r\n" : "\r");
+}
+
 // ─── OBD2 Command Handler ─────────────────────────────────────────────────────
 
 void handleOBD(String cmd) {
@@ -746,6 +793,13 @@ void handleOBD(String cmd) {
 
   uint8_t service = (uint8_t)strtol(cmd.substring(0, 2).c_str(), nullptr, 16);
   uint8_t pid     = (uint8_t)strtol(cmd.substring(2, 4).c_str(), nullptr, 16);
+
+  // ── Service 09 PID 02: full ISO-TP multi-frame VIN response ──────────────
+  if (service == 0x09 && pid == 0x02) {
+    sendVIN();
+    btPrompt();
+    return;
+  }
 
   uint8_t data[8] = {};
   int len;
